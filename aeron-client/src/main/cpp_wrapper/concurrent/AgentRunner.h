@@ -1,0 +1,235 @@
+/*
+ * Copyright 2014-2025 Real Logic Limited.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef AERON_AGENT_RUNNER_H
+#define AERON_AGENT_RUNNER_H
+
+#include <string>
+#include <functional>
+#include <thread>
+#include <atomic>
+
+#include "util/Exceptions.h"
+#include "util/ScopeUtils.h"
+#include "concurrent/logbuffer/TermReader.h"
+
+#if !defined(AERON_COMPILER_MSVC)
+#include <pthread.h>
+#endif
+
+namespace aeron {
+
+namespace concurrent {
+
+template <typename Agent, typename IdleStrategy>
+class AgentRunner
+{
+public:
+    AgentRunner(Agent &agent, IdleStrategy &idleStrategy, util::exception_handler_t &exceptionHandler) :
+        m_agent(agent),
+        m_idleStrategy(idleStrategy),
+        m_exceptionHandler(exceptionHandler),
+        m_name("aeron-agent")
+    {
+    }
+
+    AgentRunner(
+        Agent &agent,
+        IdleStrategy &idleStrategy,
+        util::exception_handler_t &exceptionHandler,
+        const std::string &name) :
+        m_agent(agent),
+        m_idleStrategy(idleStrategy),
+        m_exceptionHandler(exceptionHandler),
+        m_name(name)
+    {
+    }
+
+    /**
+     * Name given to the thread running the agent.
+     *
+     * @return the name given to the thread running the agent.
+     */
+    inline const std::string &name() const
+    {
+        return m_name;
+    }
+
+    /**
+     * Is the Agent started?
+     *
+     * @return is the Agent started?
+     */
+    inline bool isStarted() const
+    {
+        return m_isStarted.load(std::memory_order_acquire);
+    }
+
+    /**
+     * Is the Agent running?
+     *
+     * @return is the Agent started successfully and not closed?
+     */
+    inline bool isRunning() const
+    {
+        return STATE_RUNNING == m_state.load(std::memory_order_acquire);
+    }
+
+    /**
+     * Has the Agent been closed?
+     *
+     * @return has the Agent been closed?
+     */
+    inline bool isClosed() const
+    {
+        return m_isClosed.load(std::memory_order_acquire);
+    }
+
+    /**
+     * Start the Agent running. Start may be called only once and is invalid after close has been called.
+     *
+     * Will spawn a std::thread.
+     */
+    inline void start()
+    {
+        if (m_isClosed.load(std::memory_order_acquire))
+        {
+            throw util::IllegalStateException(std::string("AgentRunner closed"), SOURCEINFO, EINVAL);
+        }
+
+        bool expected = false;
+        if (!m_isStarted.compare_exchange_strong(expected, true, std::memory_order_seq_cst))
+        {
+            throw util::IllegalStateException(std::string("AgentRunner already started"), SOURCEINFO, EINVAL);
+        }
+
+        m_thread = std::thread(
+            [&]()
+            {
+#if defined(AERON_COMPILER_MSVC)
+#elif defined(__APPLE__)
+                pthread_setname_np(m_name.c_str());
+#else
+                char threadName[16UL] = {};
+                std::copy(m_name.begin(), m_name.begin() + std::min(m_name.size(), 15UL), threadName);
+                pthread_setname_np(pthread_self(), threadName);
+#endif
+                run();
+            });
+    }
+
+    /**
+     * Run the Agent duty cycle until closed.
+     */
+    inline void run()
+    {
+        int expected = STATE_NOT_EXECUTED;
+        if (!m_state.compare_exchange_strong(expected, STATE_RUNNING, std::memory_order_seq_cst))
+        {
+            return;
+        }
+
+        try
+        {
+            m_agent.onStart();
+        }
+        catch (const std::exception &exception)
+        {
+            m_state.store(STATE_STOPPED, std::memory_order_release);
+            m_exceptionHandler(exception);
+        }
+
+        while (STATE_RUNNING == m_state.load(std::memory_order_acquire))
+        {
+            try
+            {
+                m_idleStrategy.idle(m_agent.doWork());
+            }
+            catch (const util::AgentTerminationException &exception)
+            {
+                m_state.store(STATE_STOPPED, std::memory_order_release);
+                if (!exception.isExpected())
+                {
+                    m_exceptionHandler(exception);
+                }
+            }
+            catch (const std::exception &exception)
+            {
+                m_exceptionHandler(exception);
+            }
+        }
+
+        try
+        {
+            m_agent.onClose();
+        }
+        catch (const std::exception &exception)
+        {
+            m_exceptionHandler(exception);
+        }
+    }
+
+    /**
+     * Close the agent and stop the associated thread from running. This method waits for the thread to join.
+     */
+    inline void close()
+    {
+        bool expected = false;
+        if (m_isClosed.compare_exchange_strong(expected, true, std::memory_order_seq_cst))
+        {
+            int expectedState = STATE_RUNNING;
+            while (!m_state.compare_exchange_strong(expectedState, STATE_STOPPED, std::memory_order_seq_cst))
+            {
+            }
+
+            if (STATE_NOT_EXECUTED == expectedState)
+            {
+                try
+                {
+                    m_agent.onClose();
+                }
+                catch (const std::exception &exception)
+                {
+                    m_exceptionHandler(exception);
+                }
+            }
+            else if (m_isStarted.load(std::memory_order_acquire))
+            {
+                if (m_thread.joinable())
+                {
+                    m_thread.join();
+                }
+            }
+        }
+    }
+
+private:
+    static constexpr int STATE_NOT_EXECUTED = 0;
+    static constexpr int STATE_RUNNING = 1;
+    static constexpr int STATE_STOPPED = 2;
+
+    Agent &m_agent;
+    IdleStrategy &m_idleStrategy;
+    util::exception_handler_t &m_exceptionHandler;
+    std::atomic<bool> m_isStarted = { false };
+    std::atomic<int> m_state = { STATE_NOT_EXECUTED };
+    std::atomic<bool> m_isClosed = { false };
+    std::thread m_thread;
+    const std::string m_name;
+};
+
+}}
+
+#endif
